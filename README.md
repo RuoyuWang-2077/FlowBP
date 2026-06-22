@@ -381,13 +381,6 @@ You can override it without editing YAML:
 export FLOWBP_REWARD_CKPT_PATH=/path/to/reward_ckpts
 ```
 
-HPSv3 can also be pointed at explicit files:
-
-```bash
-export FLOWBP_HPSV3_CONFIG_PATH=/path/to/HPSv3_7B.yaml
-export FLOWBP_HPSV3_CHECKPOINT_PATH=/path/to/HPSv3.safetensors
-```
-
 Unavailable optional scorers can be skipped by the evaluation runner. For
 offline clusters, make sure reward-model checkpoints and any detector/backbone
 weights are pre-downloaded and that config paths point to local directories.
@@ -411,8 +404,7 @@ assets/readme/                  # README figures
 
 FlowBP builds on the broader line of direct reward-backpropagation methods for
 flow-matching alignment. We thank the [LeapAlign project](https://github.com/RockeyCoss/LeapAlign_Code)
-for its open-source implementation and for helping establish this research
-direction.
+for its open-source implementation.
 
 ## Citation
 
