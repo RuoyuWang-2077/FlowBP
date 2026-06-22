@@ -1,0 +1,79 @@
+trainer:
+  name: leapalign
+
+model:
+  pretrained_model_name_or_path: stabilityai/stable-diffusion-3.5-medium
+  gradient_checkpointing: true
+  master_weight_type: bf16
+  use_ema: true
+  ema_decay: 0.995
+
+data:
+  data_json_path: data/sd3_5_rl_embeddings/videos2caption.json
+  num_latent_t: 1
+  cfg: 0.0
+  dataloader_num_workers: 4
+
+train:
+  seed: 42
+  # Single-node 8 GPU run: 8 GPUs x train_batch_size 8 => global batch 64.
+  train_batch_size: 8
+  train_sp_batch_size: 8
+  gradient_accumulation_steps: 1
+  max_train_steps: 300
+  checkpointing_steps: 100
+  output_dir: outputs/final/sd35/sd3_5_leapalign
+  allow_tf32: true
+
+optimizer:
+  learning_rate: 1.0e-5
+  weight_decay: 0.0001
+  lr_warmup_steps: 0
+  max_grad_norm: 1.0
+
+distributed:
+  sp_size: 1
+  fsdp_sharding_startegy: full
+
+sampling:
+  h: 512
+  w: 512
+  rollout_steps: 25
+  sampling_steps: 25
+  sampler_seed: 1223627
+  cfg_guidance: 3.5
+
+reward:
+  use_hpsv2: true
+  loss_relu_clip: 0.55
+  loss_grad_scale: 1.0
+
+flowbp:
+  select_idx_seed: 114
+  min_idx: 1
+  max_idx: 26
+  alpha: 0.3
+  tau: 0.1
+
+flux2:
+  # Raw CFG baseline: no detached-negative shortcut and no 1/cfg backward compensation.
+  cfg_detach_neg: false
+  cfg_grad_norm_compensate: false
+
+eval:
+  evaluation_interval: 50
+  prompts_file: ./assets/eval_prompts.txt
+  num_imgs_per_prompt: 1
+  seed: 42
+  num_steps: 40
+  guidance_scale: 3.5
+  reward_ckpt_path: models/reward_ckpts
+  reward_fn:
+    clipscore: 1.0
+    hpsv2: 1.0
+    hpsv3: 1.0
+    pickscore: 1.0
+    imagereward: 1.0
+
+logging:
+  project: flowbp

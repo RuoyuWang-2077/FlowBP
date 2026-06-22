@@ -1,0 +1,63 @@
+trainer:
+  name: draft_lv
+model:
+  pretrained_model_name_or_path: data/flux
+  gradient_checkpointing: true
+  master_weight_type: bf16
+  use_ema: true
+  ema_decay: 0.995
+data:
+  data_json_path: data/rl_embeddings/videos2caption.json
+  num_latent_t: 1
+  cfg: 0.0
+  dataloader_num_workers: 8
+train:
+  seed: 42
+  train_batch_size: 4
+  train_sp_batch_size: 4
+  gradient_accumulation_steps: 1
+  max_train_steps: 300
+  checkpointing_steps: 100
+  allow_tf32: true
+  output_dir: outputs/final/flux1/flux1_draft_lv
+optimizer:
+  learning_rate: 1.0e-05
+  weight_decay: 0.0001
+  lr_warmup_steps: 0
+  max_grad_norm: 1.0
+distributed:
+  sp_size: 1
+  fsdp_sharding_startegy: full
+sampling:
+  h: 512
+  w: 512
+  rollout_steps: 25
+  sampling_steps: 25
+  sampler_seed: 1223627
+  cfg_guidance: 4.0
+reward:
+  use_hpsv2: true
+  loss_relu_clip: 0.55
+  loss_grad_scale: 1.0
+flowbp:
+  select_idx_seed: 114
+  min_idx: 1
+  max_idx: 26
+eval:
+  evaluation_interval: 50
+  prompts_file: ./assets/eval_prompts.txt
+  num_imgs_per_prompt: 1
+  seed: 42
+  num_steps: 50
+  guidance_scale: 4.0
+  reward_ckpt_path: models/reward_ckpts
+  reward_fn:
+    clipscore: 1.0
+    hpsv2: 1.0
+    hpsv3: 1.0
+    pickscore: 1.0
+    imagereward: 1.0
+logging:
+  project: flowbp
+draft_lv:
+  num_noised_samples: 2

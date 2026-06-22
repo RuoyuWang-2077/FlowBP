@@ -1,0 +1,79 @@
+trainer:
+  name: leapalign
+
+model:
+  pretrained_model_name_or_path: black-forest-labs/FLUX.2-klein-base-9B
+  gradient_checkpointing: true
+  master_weight_type: bf16
+  use_ema: true
+  ema_decay: 0.995
+
+data:
+  data_json_path: data/rl_embeddings_flux2_9b/captions2embed.json
+  cfg: 0.0
+  dataloader_num_workers: 4
+
+train:
+  seed: 42
+  train_batch_size: 4
+  train_sp_batch_size: 4
+  gradient_accumulation_steps: 1
+  max_train_steps: 300
+  checkpointing_steps: 100
+  output_dir: outputs/final/flux2/flux2_klein_base_9b_leapalign
+  allow_tf32: true
+
+optimizer:
+  learning_rate: 1.0e-5
+  weight_decay: 0.0001
+  lr_warmup_steps: 0
+  max_grad_norm: 1.0
+
+distributed:
+  sp_size: 1
+  fsdp_sharding_startegy: full
+
+sampling:
+  h: 512
+  w: 512
+  sampling_steps: 25
+  sampler_seed: 1223627
+  cfg_guidance: 4.0
+
+reward:
+  use_hpsv2: true
+  loss_relu_clip: 0.55
+  loss_grad_scale: 1.0
+
+flowbp:
+  select_idx_seed: 114
+  min_idx: 1
+  max_idx: 26
+  alpha: 0.3
+  tau: 0.1
+
+flux2:
+  max_sequence_length: 512
+  text_encoder_out_layers: [9, 18, 27]
+  caption_key: caption
+  use_precomputed_embeds: true
+  cfg_grad_norm_compensate: false
+  cfg_detach_neg: true
+
+eval:
+  evaluation_interval: 50
+  prompts_file: ./assets/eval_prompts.txt
+  num_imgs_per_prompt: 1
+  seed: 42
+  num_steps: 50
+  guidance_scale: 4.0
+  reward_ckpt_path: models/reward_ckpts
+  reward_fn:
+    clipscore: 1.0
+    hpsv2: 1.0
+    hpsv3: 1.0
+    pickscore: 1.0
+    imagereward: 1.0
+
+logging:
+  project: flowbp
