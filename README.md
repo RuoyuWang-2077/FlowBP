@@ -66,14 +66,27 @@ image, while memory cost and gradient depth are controlled by the surrogate.
 
 ## Table of Contents
 
+- [Highlights](#highlights)
+- [Table of Contents](#table-of-contents)
 - [Method Overview](#method-overview)
+  - [FlowBP Variants](#flowbp-variants)
 - [Main Results](#main-results)
+  - [SD3.5-M](#sd35-m)
+  - [FLUX.1-dev 12B](#flux1-dev-12b)
+  - [FLUX.2-Klein-base 9B](#flux2-klein-base-9b)
+  - [GenEval on FLUX.1-dev](#geneval-on-flux1-dev)
+- [Ablation Takeaways](#ablation-takeaways)
 - [Supported Backbones](#supported-backbones)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+  - [1. Preprocess prompts](#1-preprocess-prompts)
+  - [2. Train a FlowBP model](#2-train-a-flowbp-model)
+  - [3. Choose a final config](#3-choose-a-final-config)
 - [Evaluation](#evaluation)
 - [Repository Layout](#repository-layout)
+- [Acknowledgements](#acknowledgements)
 - [Citation](#citation)
+- [License](#license)
 
 ## Method Overview
 
