@@ -52,12 +52,8 @@ flowbp:
   select_idx_seed: 114
   min_idx: 1
   max_idx: 26
-  jk_sampling_mode: dirichlet
-  jk_dirichlet_alpha: 4.0
-  jk_dirichlet_alpha_a: 2.5
-  jk_dirichlet_alpha_b: 6.0
-  jk_dirichlet_alpha_c: 2.0
-  jk_dirichlet_max_j_rev: 10
+  # Expose only the final 70% of the rollout to gradient-carrying steps.
+  train_step_tail_ratio: 0.7
 
 flowbp_lagrange:
   alpha: 0.1
@@ -76,7 +72,7 @@ flux2:
   cfg_grad_norm_compensate: false
 
 eval:
-  evaluation_interval: 50
+  evaluation_interval: 100
   prompts_file: ./assets/eval_prompts.txt
   num_imgs_per_prompt: 1
   seed: 42
@@ -86,9 +82,10 @@ eval:
   reward_fn:
     clipscore: 1.0
     hpsv2: 1.0
-    hpsv3: 1.0
     pickscore: 1.0
     imagereward: 1.0
+    ur-align: 1.0
+    ur-iq: 1.0
 
 logging:
   project: flowbp

@@ -63,6 +63,7 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "connector_wandb_interval": "connector_wandb_interval",
         "connector_wandb_num_samples": "connector_wandb_num_samples",
         "resume_from_checkpoint": "resume_from_checkpoint",
+        "save_optimizer_state": "save_optimizer_state",
     },
     "optimizer": {
         "learning_rate": "learning_rate",
@@ -75,7 +76,9 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
     },
     "distributed": {
         "sp_size": "sp_size",
-        "fsdp_sharding_startegy": "fsdp_sharding_startegy",
+        # Historic misspelling kept as an accepted YAML key.
+        "fsdp_sharding_startegy": "fsdp_sharding_strategy",
+        "fsdp_sharding_strategy": "fsdp_sharding_strategy",
         "selective_checkpointing": "selective_checkpointing",
         "use_cpu_offload": "use_cpu_offload",
     },
@@ -91,6 +94,7 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "use_hpsv2": "use_hpsv2",
         "loss_grad_scale": "loss_grad_scale",
         "loss_relu_clip": "loss_relu_clip",
+        "reward_ckpt_path": "reward_ckpt_path",
     },
     "flowbp": {
         "select_idx_seed": "select_idx_seed",
@@ -99,28 +103,19 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "train_step_tail_ratio": "train_step_tail_ratio",
         "alpha": "alpha",
         "tau": "tau",
-        # j-k index sampling shared by FlowBP-Bridge/Lagrange
-        "jk_sampling_mode": "jk_sampling_mode",
-        "jk_dirichlet_alpha": "jk_dirichlet_alpha",
-        "jk_dirichlet_alpha_a": "jk_dirichlet_alpha_a",
-        "jk_dirichlet_alpha_b": "jk_dirichlet_alpha_b",
-        "jk_dirichlet_alpha_c": "jk_dirichlet_alpha_c",
-        "jk_dirichlet_max_j_rev": "jk_dirichlet_max_j_rev",
     },
     "refl": {
         "last_n_steps": "refl_last_n_steps",
         "refl_last_n_steps": "refl_last_n_steps",
     },
     "flowbp_sparse": {
-        "num_active_steps": "flowbp_sparse_num_active_steps",
-        "late_bias": "flowbp_sparse_late_bias",
-        "grad_rescale": "flowbp_sparse_grad_rescale",
-        "flowbp_sparse_num_active_steps": "flowbp_sparse_num_active_steps",
-        "flowbp_sparse_late_bias": "flowbp_sparse_late_bias",
-        "flowbp_sparse_grad_rescale": "flowbp_sparse_grad_rescale",
+        "num_active_steps": "num_active_steps",
+        "flowbp_sparse_num_active_steps": "num_active_steps",
     },
     "flowbp_bridge": {
         "alpha": "alpha",
+        # FlowBP-Bridge reuses the shared active-step budget knob.
+        "num_active_steps": "num_active_steps",
     },
     "drtune": {
         "num_train_steps": "drtune_num_train_steps",
@@ -136,16 +131,19 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
     },
     "flowbp_lagrange": {
         "alpha": "alpha",
-        "clip_dj_threshold": "clip_dj_threshold",
-        "clip_d0": "clip_d0",
-        "clip_d0_threshold": "clip_d0_threshold",
         "tau": "tau",
+        # FLUX.2 spelled per-sample filtering clip_*; SD3.5 spelled it
+        # traj_filter_*. Both now feed the shared knobs.
+        "clip_dj_threshold": "traj_filter_dj_max",
+        "clip_d0_threshold": "traj_filter_d0_max",
+        "clip_d0": "clip_d0",
+        "traj_filter_dj_max": "traj_filter_dj_max",
+        "traj_filter_d0_max": "traj_filter_d0_max",
         "connector_order": "flowbp_lagrange_connector_order",
         "detach_history": "flowbp_lagrange_detach_history",
         "grad_support_mode": "flowbp_lagrange_grad_support_mode",
         "grad_support_scale": "flowbp_lagrange_grad_support_scale",
         "max_active_supports": "flowbp_lagrange_max_active_supports",
-        "grad_rescale": "flowbp_lagrange_grad_rescale",
         "weight_scheme": "flowbp_lagrange_weight_scheme",
         "anchor_lambda": "flowbp_lagrange_anchor_lambda",
         "debug_connector": "debug_flowbp_lagrange_connector",
@@ -154,7 +152,6 @@ _SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "flowbp_lagrange_grad_support_mode": "flowbp_lagrange_grad_support_mode",
         "flowbp_lagrange_grad_support_scale": "flowbp_lagrange_grad_support_scale",
         "flowbp_lagrange_max_active_supports": "flowbp_lagrange_max_active_supports",
-        "flowbp_lagrange_grad_rescale": "flowbp_lagrange_grad_rescale",
         "flowbp_lagrange_weight_scheme": "flowbp_lagrange_weight_scheme",
         "flowbp_lagrange_anchor_lambda": "flowbp_lagrange_anchor_lambda",
         "debug_flowbp_lagrange_connector": "debug_flowbp_lagrange_connector",

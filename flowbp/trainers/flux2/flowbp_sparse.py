@@ -5,22 +5,20 @@ Mirrors :mod:`flowbp.trainers.flux1.flowbp_sparse` but uses the FLUX.2
 forward / latent packing pipeline (Qwen3 text embeds + 4D position ids,
 patchify+BN VAE normalization, ``_cfg_aware_forward`` for undistilled
 checkpoints). The connector math — late-biased step sampling, full Euler
-composition, straight-through residual onto the cached ``x_0``, and the
-``flowbp_sparse_grad_rescale`` gradient compensation are reused from the
-FLUX.1 implementation so behavior stays in lock-step across the two backbones.
+composition, and straight-through residual onto the cached ``x_0`` are reused
+from the FLUX.1 implementation so behavior stays in lock-step across the two
+backbones.
 
 Algorithm recap:
 
 1. Roll out the full N-step FLUX.2 trajectory once with ``no_grad`` and cache
    ``(x_history, v_history)``.
-2. Sample ``flowbp_sparse_num_active_steps`` distinct timesteps from a power-law
-   distribution ``w_i ∝ (i+1)^flowbp_sparse_late_bias`` (bigger idx → smaller
-   sigma → closer to clean image gets more weight).
+2. Sample ``num_active_steps`` distinct timesteps uniformly from the
+   trainable window.
 3. Re-forward the transformer at those K cached ``x_k``'s WITH gradient
    enabled, replacing the cached detached velocity.
 4. Compose ``x_0_hat`` in fp32 via full Euler integration; cached steps use
-   the detached cached velocity, active steps use the new differentiable one
-   (scaled by ``flowbp_sparse_grad_rescale``).
+   the detached cached velocity, active steps use the new differentiable one.
 5. Straight-through: forward value = true cached ``x_0``; backward flows
    only through the K active velocities.
 """
@@ -30,6 +28,8 @@ from __future__ import annotations
 import os
 
 import torch
+
+from flowbp.trainers.flux2.leapalign import _maybe_log_connector_wandb
 import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
@@ -37,7 +37,7 @@ import wandb
 from flowbp.trainers.common.rollout_window import resolve_train_step_window
 from flowbp.trainers.flux1.flowbp_sparse import (
     _compose_x0_from_velocities,
-    _sample_late_biased_indices,
+    _sample_active_indices,
 )
 from flowbp.trainers.flux2.flowbp_lagrange import (
     _model_forward,
@@ -53,37 +53,6 @@ from flowbp.trainers.flux2.leapalign import (
 )
 
 
-def _maybe_log_connector_wandb(args, vae, prefix: str, payload: dict | None) -> None:
-    """FLUX.2 image-logging hook tailored to FlowBP-Sparse payload keys.
-
-    FlowBP-Sparse only produces ``x0_pred`` / ``x0_true`` (there is
-    no intermediate ``x_j`` like LeapAlign / FlowBP-Lagrange), so we only decode
-    those two tensors.
-    but routed through the FLUX.2 VAE de-BN + unpatchify path in
-    ``_decode_packed_latents_for_wandb``.
-    """
-    interval = int(getattr(args, "connector_wandb_interval", 0) or 0)
-    step = getattr(args, "current_train_step", None)
-    if interval <= 0 or step is None or int(step) % interval != 0:
-        return
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return
-    if payload is None or wandb.run is None:
-        return
-
-    max_samples = int(getattr(args, "connector_wandb_num_samples", 2) or 2)
-    log_payload = {}
-    for name in ("x0_pred", "x0_true"):
-        images = _decode_packed_latents_for_wandb(
-            args, vae, payload.get(name), max_samples,
-        )
-        if images:
-            log_payload[f"connector/{prefix}_{name}"] = [
-                wandb.Image(image, caption=f"{prefix} {name} sample {idx}")
-                for idx, image in enumerate(images)
-            ]
-    if log_payload:
-        wandb.log(log_payload, step=int(step))
 
 
 def sample_flowbp_sparse_trajectory(
@@ -111,26 +80,15 @@ def sample_flowbp_sparse_trajectory(
 
     train_start_idx, train_end_idx = resolve_train_step_window(args, total_steps)
     train_window_len = train_end_idx - train_start_idx
-    num_active = int(getattr(args, "flowbp_sparse_num_active_steps", 3))
+    num_active = int(args.num_active_steps)
     if num_active < 1:
         raise ValueError(
-            f"flowbp_sparse_num_active_steps must be >=1, got {num_active}"
+            f"num_active_steps must be >=1, got {num_active}"
         )
     num_active = min(num_active, train_window_len)
-    late_bias = float(getattr(args, "flowbp_sparse_late_bias", 2.0))
-    grad_rescale = float(getattr(args, "flowbp_sparse_grad_rescale", 0.0))
-    # gr=0  -> no rescale (raw per-step delta-sigma_k gradient).
-    # gr=1  -> full Euler-equivalent (active velocity coefficient = sum |delta-sigma_all|).
-    # gr>1  -> push beyond full Euler magnitude.
-    if grad_rescale < 0.0:
-        raise ValueError(
-            f"flowbp_sparse_grad_rescale must be >= 0, got {grad_rescale}"
-        )
-
-    selected_indices = _sample_late_biased_indices(
+    selected_indices = _sample_active_indices(
         num_steps=total_steps,
         num_active=num_active,
-        bias=late_bias,
         generator=generator,
         start_idx=train_start_idx,
         end_idx=train_end_idx,
@@ -142,11 +100,6 @@ def sample_flowbp_sparse_trajectory(
     deltas_abs = (sigmas_seg[1:] - sigmas_seg[:-1]).abs()
     total_abs = deltas_abs[train_start_idx:train_end_idx].sum()
     active_abs = sum(deltas_abs[k] for k in selected_indices)
-
-    grad_rescale_factor = 1.0
-    if grad_rescale > 0.0 and float(active_abs) > 1e-8:
-        full_factor = float((total_abs / active_abs).item())
-        grad_rescale_factor = 1.0 + grad_rescale * (full_factor - 1.0)
 
     # Re-forward each selected step with grad on transformer params.
     # ``_model_forward`` here is the FLUX.2 version (no pooled_projections,
@@ -170,7 +123,6 @@ def sample_flowbp_sparse_trajectory(
         sigmas=cache["sigmas"],
         v_history=cache["v_history"],
         active_velocities=active_velocities,
-        grad_rescale_factor=grad_rescale_factor,
     )
 
     x_0_true = cache["x0"].detach()
@@ -199,17 +151,8 @@ def sample_flowbp_sparse_trajectory(
         "active_min_idx": selected_idx_tensor.min(),
         "active_max_idx": selected_idx_tensor.max(),
         "active_mean_idx": selected_idx_tensor.mean(),
-        "grad_rescale_factor": torch.tensor(
-            float(grad_rescale_factor), device=device, dtype=torch.float32,
-        ),
         "active_abs_weight_sum": active_abs.detach().float(),
         "total_abs_weight_sum": total_abs.detach().float(),
-        "flowbp_sparse_grad_rescale": torch.tensor(
-            float(grad_rescale), device=device, dtype=torch.float32,
-        ),
-        "flowbp_sparse_late_bias": torch.tensor(
-            float(late_bias), device=device, dtype=torch.float32,
-        ),
         "train_step_start_idx": torch.tensor(
             float(train_start_idx), device=device, dtype=torch.float32,
         ),
@@ -228,9 +171,6 @@ def sample_flowbp_sparse_trajectory(
         "x0_pred": x_0_hat.detach(),
         "x0_true": x_0_true.detach(),
         "compose_err_per_sample": err_compose_per_sample.detach(),
-        "grad_rescale_factor": float(grad_rescale_factor),
-        "flowbp_sparse_grad_rescale": float(grad_rescale),
-        "flowbp_sparse_late_bias": float(late_bias),
         "train_step_start_idx": int(train_start_idx),
         "train_step_end_idx": int(train_end_idx),
         "active_count": int(num_active),
@@ -337,7 +277,7 @@ def train_flowbp_sparse_one_step_flux2(
     avg_loss = loss.detach()
     backward_factor = 1.0 / args.gradient_accumulation_steps
     cfg_scale = float(getattr(args, "cfg_guidance", 1.0))
-    cfg_compensate = bool(getattr(args, "cfg_grad_norm_compensate", True))
+    cfg_compensate = bool(args.cfg_grad_norm_compensate)
     if cfg_scale > 1.0 and cfg_compensate:
         backward_factor = backward_factor / cfg_scale
     (loss * backward_factor).backward()
@@ -385,7 +325,7 @@ class FlowBPSparseFlux2Trainer(LeapAlignFlux2Trainer):
     Single rollout per training step; K active steps re-forwarded with
     grad; full Euler composition gives ``x_0_hat`` matching the true cached
     ``x_0`` in forward, while backward flows only through the K active
-    velocities, each rescaled by ``flowbp_sparse_grad_rescale``.
+    velocities.
     """
 
     def train(self):

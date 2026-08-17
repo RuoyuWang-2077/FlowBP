@@ -43,10 +43,6 @@ flowbp:
   select_idx_seed: 114
   min_idx: 1
   max_idx: 26
-  jk_sampling_mode: dirichlet
-  jk_dirichlet_alpha_a: 2.5
-  jk_dirichlet_alpha_b: 6.0
-  jk_dirichlet_alpha_c: 2.0
 flowbp_lagrange:
   alpha: 0.1
   tau: 0.2
@@ -55,12 +51,11 @@ flowbp_lagrange:
   grad_support_mode: midpoint
   grad_support_scale: 0.25
   max_active_supports: 2
-  grad_rescale: 0.5
   weight_scheme: lagrange
   debug_connector: false
   anchor_lambda: 1.0
 eval:
-  evaluation_interval: 50
+  evaluation_interval: 100
   prompts_file: ./assets/eval_prompts.txt
   num_imgs_per_prompt: 1
   seed: 42
@@ -72,5 +67,7 @@ eval:
     hpsv2: 1.0
     pickscore: 1.0
     imagereward: 1.0
+    ur-align: 1.0
+    ur-iq: 1.0
 logging:
   project: flowbp

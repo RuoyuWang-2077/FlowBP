@@ -249,7 +249,6 @@ def _lagrange_quadrature_predict(
     detach_history=True,
     support_indices=None,
     active_velocities=None,
-    grad_rescale=0.0,
     weight_scheme="lagrange",
 ):
     """FlowBP-Lagrange interval quadrature connector via Lagrange or uniform weights."""
@@ -306,29 +305,12 @@ def _lagrange_quadrature_predict(
         )
     start_pos = support_indices.index(start_idx)
 
-    grad_rescale_factor = 1.0
-    if grad_rescale > 0 and active_support_indices:
-        total_abs_weight = weights.abs().sum()
-        idx_to_pos = {idx: pos for pos, idx in enumerate(support_indices)}
-        active_abs_weight = sum(
-            weights[idx_to_pos[idx]].abs() for idx in active_support_indices
-        )
-        if active_abs_weight > 1e-8:
-            full_factor = (total_abs_weight / active_abs_weight).item()
-            grad_rescale_factor = 1.0 + grad_rescale * (full_factor - 1.0)
-
     delta = torch.zeros_like(x_start, dtype=torch.float32)
     for weight, idx in zip(weights, support_indices):
         if idx in active_velocities:
             velocity = active_velocities[idx]
-            if grad_rescale_factor != 1.0:
-                v_detached = velocity.detach()
-                velocity = v_detached + grad_rescale_factor * (velocity - v_detached)
         elif idx == start_idx and use_start_velocity_gradient:
             velocity = current_v
-            if grad_rescale_factor != 1.0:
-                v_detached = velocity.detach()
-                velocity = v_detached + grad_rescale_factor * (velocity - v_detached)
         else:
             velocity = cached_velocities[idx]
             if detach_history:
@@ -341,8 +323,5 @@ def _lagrange_quadrature_predict(
         "weights": weights.detach(),
         "start_weight": weights[start_pos].detach(),
         "weight_abs_sum": weights.abs().sum().detach(),
-        "grad_rescale_factor": torch.tensor(
-            grad_rescale_factor, device=device, dtype=torch.float32
-        ),
     }
     return x_start.float() + delta, info

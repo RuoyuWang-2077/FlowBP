@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 
 from flowbp.trainers.common.rollout_window import resolve_train_step_window
-from flowbp.trainers.sd35.flowbp_sparse import _sample_late_biased_indices
+from flowbp.trainers.sd35.flowbp_sparse import _sample_active_indices
 from flowbp.trainers.sd35.flowbp_lagrange import _rollout_with_cache_sd35
 from flowbp.trainers.common.jk_sampling import sample_jk_indices
 from flowbp.trainers.sd35.leapalign import (
@@ -30,7 +30,6 @@ def _compose_interval_from_velocities_sd35(
     start_idx: int,
     target_idx: int,
     active_velocities: dict[int, torch.Tensor],
-    grad_rescale_factor: float,
 ) -> torch.Tensor:
     """Exact Euler composition over one trajectory interval."""
     if target_idx <= start_idx:
@@ -50,7 +49,6 @@ def _compose_interval_from_velocities_sd35(
         delta = sigma_next - sigma_i
         if idx in active_velocities:
             v = active_velocities[idx].float()
-            v = v.detach() + grad_rescale_factor * (v - v.detach())
         else:
             v = v_history[idx].detach().float()
         x = x + delta * v
@@ -102,13 +100,11 @@ def _sample_flowbp_bridge_segment_indices(
     start_idx: int,
     length: int,
     num_active: int,
-    late_bias: float,
     generator: torch.Generator | None,
 ) -> list[int]:
-    offsets = _sample_late_biased_indices(
+    offsets = _sample_active_indices(
         num_steps=length,
         num_active=num_active,
-        bias=late_bias,
         generator=generator,
     )
     return [int(start_idx + offset) for offset in offsets]
@@ -118,7 +114,6 @@ def _sample_flowbp_bridge_post_indices(
     j_idx: int,
     post_len: int,
     num_active: int,
-    late_bias: float,
     generator: torch.Generator | None,
 ) -> list[int]:
     """Sample post-segment active steps while always activating the anchor j."""
@@ -131,7 +126,6 @@ def _sample_flowbp_bridge_post_indices(
                 start_idx=int(j_idx) + 1,
                 length=int(post_len) - 1,
                 num_active=remaining,
-                late_bias=late_bias,
                 generator=generator,
             )
         )
@@ -199,7 +193,6 @@ def sample_flowbp_bridge_trajectory_sd35(
     assert len(cache["sigmas"]) >= total_steps + 1
 
     select_indices, k_idx, j_idx = sample_jk_indices(args, total_steps, generator)
-    jk_truncated = bool(getattr(args, "_last_jk_truncated", False))
     train_start_idx, train_end_idx = resolve_train_step_window(
         args,
         total_steps,
@@ -208,30 +201,23 @@ def sample_flowbp_bridge_trajectory_sd35(
     pre_len = int(j_idx) - train_start_idx
     post_len = int(total_steps - j_idx)
 
-    num_active_total = int(getattr(args, "flowbp_sparse_num_active_steps", 4))
+    num_active_total = int(args.num_active_steps)
     pre_active_count, post_active_count = _allocate_flowbp_bridge_active_counts(
         num_active_total,
         pre_len,
         post_len,
     )
 
-    late_bias = float(getattr(args, "flowbp_sparse_late_bias", 2.0))
-    grad_rescale = float(getattr(args, "flowbp_sparse_grad_rescale", 0.0))
-    if grad_rescale < 0.0:
-        raise ValueError(f"flowbp_sparse_grad_rescale must be >= 0, got {grad_rescale}")
-
     pre_active_indices = _sample_flowbp_bridge_segment_indices(
         start_idx=train_start_idx,
         length=pre_len,
         num_active=pre_active_count,
-        late_bias=late_bias,
         generator=generator,
     )
     post_active_indices = _sample_flowbp_bridge_post_indices(
         j_idx=j_idx,
         post_len=post_len,
         num_active=post_active_count,
-        late_bias=late_bias,
         generator=generator,
     )
     active_indices = pre_active_indices + post_active_indices
@@ -243,11 +229,6 @@ def sample_flowbp_bridge_trajectory_sd35(
     deltas_abs = (sigmas_full[1:] - sigmas_full[:-1]).abs()
     total_abs = deltas_abs[train_start_idx:train_end_idx].sum()
     active_abs = sum(deltas_abs[idx] for idx in active_indices)
-
-    grad_rescale_factor = 1.0
-    if grad_rescale > 0.0 and float(active_abs) > 1e-8:
-        full_factor = float((total_abs / active_abs).item())
-        grad_rescale_factor = 1.0 + grad_rescale * (full_factor - 1.0)
 
     pre_active_velocities = _build_flowbp_bridge_active_velocities_sd35(
         args=args,
@@ -271,7 +252,6 @@ def sample_flowbp_bridge_trajectory_sd35(
         start_idx=0,
         target_idx=j_idx,
         active_velocities=pre_active_velocities,
-        grad_rescale_factor=grad_rescale_factor,
     )
     xj_conn = xj_hat + (x_j - xj_hat).detach()
     xj_conn = xj_conn.to(torch.bfloat16)
@@ -300,7 +280,6 @@ def sample_flowbp_bridge_trajectory_sd35(
         start_idx=j_idx,
         target_idx=total_steps,
         active_velocities=post_active_velocities,
-        grad_rescale_factor=grad_rescale_factor,
     )
     x0_true = cache["x0"].detach()
     x0_conn = x0_hat + (x0_true - x0_hat).detach()
@@ -342,11 +321,8 @@ def sample_flowbp_bridge_trajectory_sd35(
             device=device,
             dtype=torch.float32,
         ),
-        "grad_rescale_factor": torch.tensor(float(grad_rescale_factor), device=device, dtype=torch.float32),
         "active_abs_weight_sum": active_abs.detach().float(),
         "total_abs_weight_sum": total_abs.detach().float(),
-        "flowbp_sparse_grad_rescale": torch.tensor(float(grad_rescale), device=device, dtype=torch.float32),
-        "flowbp_sparse_late_bias": torch.tensor(float(late_bias), device=device, dtype=torch.float32),
         "alpha": torch.tensor(float(alpha), device=device, dtype=torch.float32),
         "train_step_start_idx": torch.tensor(float(train_start_idx), device=device, dtype=torch.float32),
         "train_step_end_idx": torch.tensor(float(train_end_idx), device=device, dtype=torch.float32),
@@ -355,7 +331,6 @@ def sample_flowbp_bridge_trajectory_sd35(
         "jk_gap": torch.tensor(float(j_idx - k_idx), device=device, dtype=torch.float32),
         "j_rev": torch.tensor(float(total_steps - j_idx), device=device, dtype=torch.float32),
         "k_rev": torch.tensor(float(total_steps - k_idx), device=device, dtype=torch.float32),
-        "jk_truncated": torch.tensor(1.0 if jk_truncated else 0.0, device=device, dtype=torch.float32),
     }
     traj_metrics.update(filter_metrics)
 
@@ -373,9 +348,6 @@ def sample_flowbp_bridge_trajectory_sd35(
         "x0": x0_true.detach(),
         "dj_per_sample": d_j.detach(),
         "d0_per_sample": d_0.detach(),
-        "grad_rescale_factor": float(grad_rescale_factor),
-        "flowbp_sparse_grad_rescale": float(grad_rescale),
-        "flowbp_sparse_late_bias": float(late_bias),
         "alpha": float(alpha),
         "train_step_start_idx": int(train_start_idx),
         "train_step_end_idx": int(train_end_idx),

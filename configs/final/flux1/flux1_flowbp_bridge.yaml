@@ -45,12 +45,10 @@ flowbp:
   max_idx: 26
 flowbp_sparse:
   num_active_steps: 5
-  late_bias: 2.0
-  grad_rescale: 1.0
 flowbp_bridge:
   alpha: 0.1
 eval:
-  evaluation_interval: 50
+  evaluation_interval: 100
   prompts_file: ./assets/eval_prompts.txt
   num_imgs_per_prompt: 1
   seed: 42
@@ -62,5 +60,7 @@ eval:
     hpsv2: 1.0
     pickscore: 1.0
     imagereward: 1.0
+    ur-align: 1.0
+    ur-iq: 1.0
 logging:
   project: flowbp

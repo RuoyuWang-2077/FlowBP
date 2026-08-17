@@ -54,7 +54,7 @@ flux2:
   cfg_grad_norm_compensate: false
   cfg_detach_neg: true
 eval:
-  evaluation_interval: 50
+  evaluation_interval: 100
   prompts_file: ./assets/eval_prompts.txt
   num_imgs_per_prompt: 1
   seed: 42
@@ -64,8 +64,9 @@ eval:
   reward_fn:
     clipscore: 1.0
     hpsv2: 1.0
-    hpsv3: 1.0
     pickscore: 1.0
     imagereward: 1.0
+    ur-align: 1.0
+    ur-iq: 1.0
 logging:
   project: flowbp

@@ -203,3 +203,11 @@ xxhash==3.6.0
 yapf==0.43.0
 yarl==1.23.0
 zipp==3.23.0
+
+# Optional: the `ur-align` / `ur-iq` rewards load UnifiedReward through
+# LLaVA-NeXT. Install it separately and WITHOUT dependencies, because its pins
+# would downgrade transformers below the version the FLUX.2 Qwen3 text encoder
+# requires:
+#   pip install --no-deps git+https://github.com/LLaVA-VL/LLaVA-NeXT.git
+# Alternatively serve the model over an OpenAI-compatible endpoint and set
+# FLOWBP_UNIFIEDREWARD_BACKEND=openai.

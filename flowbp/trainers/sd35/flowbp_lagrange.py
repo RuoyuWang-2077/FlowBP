@@ -80,9 +80,9 @@ def _build_active_support_velocities_sd35(
     negative_prompt_embeds,
     negative_pooled_prompt_embeds,
 ):
-    mode = getattr(args, "flowbp_lagrange_grad_support_mode", "start")
+    mode = args.flowbp_lagrange_grad_support_mode
     max_active = getattr(args, "flowbp_lagrange_max_active_supports", None)
-    grad_scale = float(getattr(args, "flowbp_lagrange_grad_support_scale", 1.0))
+    grad_scale = float(args.flowbp_lagrange_grad_support_scale)
     active_indices = _select_active_support_indices(
         support_indices=support_indices,
         start_idx=start_idx,
@@ -134,14 +134,12 @@ def sample_flowbp_lagrange_trajectory_sd35(
     timesteps = cache["timesteps"]
     total_steps = timesteps.size(0)
     select_indices, k_idx, j_idx = sample_jk_indices(args, total_steps, generator)
-    jk_truncated = bool(getattr(args, "_last_jk_truncated", False))
     x_k = cache["x_history"][k_idx]
     x_j = cache["x_history"][j_idx]
     x_0 = cache["x0"]
-    connector_order = int(getattr(args, "flowbp_lagrange_connector_order", 4))
-    detach_history = bool(getattr(args, "flowbp_lagrange_detach_history", True))
-    grad_rescale = float(getattr(args, "flowbp_lagrange_grad_rescale", 0.0))
-    weight_scheme = getattr(args, "flowbp_lagrange_weight_scheme", "lagrange")
+    connector_order = int(args.flowbp_lagrange_connector_order)
+    detach_history = bool(args.flowbp_lagrange_detach_history)
+    weight_scheme = args.flowbp_lagrange_weight_scheme
 
     support_kj = _select_interval_support_indices(
         start_idx=k_idx,
@@ -183,14 +181,13 @@ def sample_flowbp_lagrange_trajectory_sd35(
         detach_history=detach_history,
         support_indices=support_kj,
         active_velocities=active_velocities_kj,
-        grad_rescale=grad_rescale,
         weight_scheme=weight_scheme,
     )
     sigma_k = cache["sigmas"][k_idx].to(device=x_k.device, dtype=torch.float32)
     sigma_j = cache["sigmas"][j_idx].to(device=x_k.device, dtype=torch.float32)
     xj_euler = x_k.float() + (sigma_j - sigma_k) * v_k.float()
 
-    anchor_lambda = float(getattr(args, "flowbp_lagrange_anchor_lambda", 1.0))
+    anchor_lambda = float(args.flowbp_lagrange_anchor_lambda)
     if anchor_lambda < 0.0 or anchor_lambda > 1.0:
         raise ValueError(
             f"flowbp_lagrange_anchor_lambda must be in [0, 1], got {anchor_lambda}"
@@ -247,7 +244,6 @@ def sample_flowbp_lagrange_trajectory_sd35(
         detach_history=detach_history,
         support_indices=support_j0,
         active_velocities=active_velocities_j0,
-        grad_rescale=grad_rescale,
         weight_scheme=weight_scheme,
     )
     xhat_0_pred = xhat_0_pred.to(torch.bfloat16)
@@ -265,7 +261,7 @@ def sample_flowbp_lagrange_trajectory_sd35(
         dim=tuple(range(1, x_j.ndim)),
         keepdim=False,
     )
-    payload = {
+    connector_payload = {
         "step": getattr(args, "current_train_step", None),
         "k_idx": k_idx,
         "j_idx": j_idx,
@@ -289,8 +285,8 @@ def sample_flowbp_lagrange_trajectory_sd35(
         "dj_lagrange_per_sample": d_j_lagrange_per_sample.detach(),
         "connector_scheme": "sd35_flowbp_lagrange",
     }
-    _maybe_save_connector_dump(args, "sd35_flowbp_lagrange", payload)
-    args._last_connector_payload = payload
+    _maybe_save_connector_dump(args, "sd35_flowbp_lagrange", connector_payload)
+    args._last_connector_payload = connector_payload
 
     tau = float(args.tau)
     d_j_clipped = d_j.clip(min=float(tau))
@@ -333,7 +329,6 @@ def sample_flowbp_lagrange_trajectory_sd35(
         "jk_gap": torch.tensor(float(j_idx - k_idx), device=x_0.device, dtype=torch.float32),
         "j_rev": torch.tensor(float(total_steps - j_idx), device=x_0.device, dtype=torch.float32),
         "k_rev": torch.tensor(float(total_steps - k_idx), device=x_0.device, dtype=torch.float32),
-        "jk_truncated": torch.tensor(1.0 if jk_truncated else 0.0, device=x_0.device, dtype=torch.float32),
         "flowbp_lagrange_anchor_lambda": torch.tensor(
             float(anchor_lambda), device=x_0.device, dtype=torch.float32
         ),
@@ -351,8 +346,6 @@ def sample_flowbp_lagrange_trajectory_sd35(
         "j0_active_support_max": stat(active_indices_j0, "max"),
         "kj_active_support_span": stat(active_indices_kj, "span"),
         "j0_active_support_span": stat(active_indices_j0, "span"),
-        "kj_grad_rescale": info_kj["grad_rescale_factor"],
-        "j0_grad_rescale": info_j0["grad_rescale_factor"],
         "flowbp_lagrange_weight_scheme_is_uniform": torch.tensor(
             1.0 if str(weight_scheme).lower() == "uniform" else 0.0,
             device=x_0.device,

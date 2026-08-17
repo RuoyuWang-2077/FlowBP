@@ -35,12 +35,23 @@ from flowbp.trainers.common.flowbp_lagrange_utils import (
     _jk_histogram_buffer,
     save_jk_sampling_csv,
 )
+from flowbp.trainers.common.connector_logging import (
+    build_traj_filter_mask,
+    maybe_log_connector_wandb,
+    maybe_save_connector_dump,
+)
 from flowbp.trainers.common.jk_sampling import sample_jk_indices
-from flowbp.utils.checkpoint import save_checkpoint
+from flowbp.trainers.common.reward_model import init_hpsv2_reward_model
+from flowbp.utils.checkpoint import (
+    ema_checkpoint_dir,
+    load_transformer_weights,
+    resolve_resume_checkpoint,
+    resume_training_state,
+    save_checkpoint,
+)
 from flowbp.utils.debug_utils import setup_debug
 from flowbp.utils.ema_utils import save_sharded_ema_checkpoint
 from flowbp.utils.fsdp_util import apply_fsdp_checkpointing, get_dit_fsdp_kwargs
-from flowbp.utils.hpsv2_transforms import HPSV2TransformsWithGrad
 from flowbp.utils.logging_ import main_print
 from flowbp.utils.parallel_states import (
     destroy_sequence_parallel_group,
@@ -182,7 +193,7 @@ def _model_forward_sd35(
     if not _should_apply_cfg(args, negative_prompt_embeds, negative_pooled_prompt_embeds):
         return pred_cond
 
-    detach_negative_branch = bool(getattr(args, "cfg_detach_neg", True))
+    detach_negative_branch = bool(args.cfg_detach_neg)
     neg_latents = latents.detach() if detach_negative_branch else latents
 
     if detach_negative_branch:
@@ -232,74 +243,29 @@ def _maybe_decode_sd35_for_wandb(args, vae, latents, max_samples):
     ]
 
 
-def _maybe_log_connector_wandb(args, vae, prefix, payload):
-    interval = int(getattr(args, "connector_wandb_interval", getattr(args, "connector_dump_interval", 0)) or 0)
-    step = getattr(args, "current_train_step", None)
-    if interval <= 0 or step is None or int(step) % interval != 0:
-        return
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return
-    if payload is None or wandb.run is None:
-        return
-    max_samples = int(getattr(args, "connector_wandb_num_samples", 2) or 2)
-    log_payload = {}
-    for name in ("xj_pred", "xj", "x0_pred", "x0"):
-        images = _maybe_decode_sd35_for_wandb(args, vae, payload.get(name), max_samples)
-        if images:
-            log_payload[f"connector/{prefix}_{name}"] = [
-                wandb.Image(image, caption=f"{prefix} {name} sample {idx}")
-                for idx, image in enumerate(images)
-            ]
-    if log_payload:
-        wandb.log(log_payload, step=int(step))
+
+
+
+
+
+
 
 
 def _maybe_save_connector_dump(args, prefix, payload):
-    interval = int(getattr(args, "connector_dump_interval", 0) or 0)
-    step = getattr(args, "current_train_step", None)
-    if interval <= 0 or step is None or int(step) % interval != 0:
-        return
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        return
-    dump_dir = getattr(args, "connector_dump_dir", None) or os.path.join(args.output_dir, "connector_dumps")
-    os.makedirs(dump_dir, exist_ok=True)
-    saved = {
-        key: value.detach().cpu() if torch.is_tensor(value) else value
-        for key, value in payload.items()
-    }
-    torch.save(saved, os.path.join(dump_dir, f"{prefix}_step_{int(step):06d}.pt"))
+    maybe_save_connector_dump(args, prefix, payload)
 
 
-def _optional_positive_float(value):
-    if value is None:
-        return None
-    value = float(value)
-    return value if value > 0 else None
+def _maybe_log_connector_wandb(args, vae, prefix, payload):
+    maybe_log_connector_wandb(
+        args,
+        prefix,
+        payload,
+        lambda latents, n: _maybe_decode_sd35_for_wandb(args, vae, latents, n),
+    )
 
 
-def _build_traj_filter_mask(args, d_j: torch.Tensor, d_0: torch.Tensor):
-    """Return keep mask for per-sample trajectory filtering, or None if disabled."""
-    dj_max = _optional_positive_float(getattr(args, "traj_filter_dj_max", None))
-    d0_max = _optional_positive_float(getattr(args, "traj_filter_d0_max", None))
-    if dj_max is None and d0_max is None:
-        args._last_sample_keep_mask = None
-        return None, {}
-
-    keep_mask = torch.ones_like(d_j, dtype=torch.bool)
-    if dj_max is not None:
-        keep_mask = keep_mask & (d_j <= dj_max)
-    if d0_max is not None:
-        keep_mask = keep_mask & (d_0 <= d0_max)
-
-    args._last_sample_keep_mask = keep_mask.detach()
-    keep_rate = keep_mask.float().mean()
-    return keep_mask, {
-        "traj_filter_enabled": torch.tensor(1.0, device=d_j.device, dtype=torch.float32),
-        "traj_filter_keep_rate": keep_rate.detach(),
-        "traj_filter_drop_rate": (1.0 - keep_rate).detach(),
-        "traj_filter_kept": keep_mask.float().sum().detach(),
-    }
-
+def _build_traj_filter_mask(args, d_j, d_0):
+    return build_traj_filter_mask(args, d_j, d_0)
 
 def sample_trajectory_sd35(
     args,
@@ -318,7 +284,6 @@ def sample_trajectory_sd35(
     select_indices, k_idx, j_idx = sample_jk_indices(
         args, timesteps.size(0), generator
     )
-    jk_truncated = bool(getattr(args, "_last_jk_truncated", False))
     grad_on_ind_set = set(
         timesteps.size(0) - select_index.item()
         for select_index in select_indices
@@ -405,7 +370,6 @@ def sample_trajectory_sd35(
         "jk_gap": torch.tensor(float(j_idx - k_idx), device=latents_xt.device, dtype=torch.float32),
         "j_rev": torch.tensor(float(timesteps.size(0) - j_idx), device=latents_xt.device, dtype=torch.float32),
         "k_rev": torch.tensor(float(timesteps.size(0) - k_idx), device=latents_xt.device, dtype=torch.float32),
-        "jk_truncated": torch.tensor(1.0 if jk_truncated else 0.0, device=latents_xt.device, dtype=torch.float32),
     })
 
     latents_pred_x0 = latents_pred_x0 + (latents_xt - latents_pred_x0).detach()
@@ -652,7 +616,7 @@ def train_sd35_one_step(
     # amplification from CFG, so guidance changes mostly affect the forward
     # rollout rather than the optimizer step size.
     cfg_compensation = float(getattr(args, "cfg_guidance", 1.0))
-    use_cfg_compensation = bool(getattr(args, "cfg_grad_norm_compensate", True))
+    use_cfg_compensation = bool(args.cfg_grad_norm_compensate)
     backward_divisor = float(args.gradient_accumulation_steps) * (
         cfg_compensation
         if (
@@ -683,39 +647,6 @@ def train_sd35_one_step(
     else:
         grad_norm = None
     return avg_loss.item(), avg_reward_pred_x0.item(), grad_norm, reduced_traj_metrics
-
-
-def _init_hpsv2(args, device):
-    from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
-
-    model, _, preprocess_val = create_model_and_transforms(
-        "ViT-H-14",
-        "./hps_ckpt/open_clip_pytorch_model.bin",
-        precision="amp",
-        device=device,
-        jit=False,
-        force_quick_gelu=False,
-        force_custom_text=False,
-        force_patch_dropout=False,
-        force_image_size=None,
-        pretrained_image=False,
-        image_mean=None,
-        image_std=None,
-        light_augmentation=True,
-        aug_cfg={},
-        output_dict=True,
-        with_score_predictor=False,
-        with_region_predictor=False,
-    )
-    preprocess_val = HPSV2TransformsWithGrad(preprocess_val)
-    checkpoint = torch.load("./hps_ckpt/HPS_v2.1_compressed.pt", map_location=f"cuda:{device}")
-    model.load_state_dict(checkpoint["state_dict"])
-    processor = get_tokenizer("ViT-H-14")
-    reward_model = model.to(device)
-    reward_model.requires_grad_(False)
-    reward_model.eval()
-    return reward_model, processor, preprocess_val
-
 
 
 def normalize_sd35_trainer_name(name: str | None) -> str:
@@ -775,9 +706,13 @@ def run_training_sd35(args):
     if rank <= 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 
+    resume_ckpt_dir = resolve_resume_checkpoint(
+        getattr(args, "resume_from_checkpoint", None), args.output_dir
+    )
+
     if not args.use_hpsv2:
         raise NotImplementedError("Only HPSv2 is currently supported as the reward model.")
-    reward_model, processor, preprocess_val = _init_hpsv2(args, device)
+    reward_model, processor, preprocess_val = init_hpsv2_reward_model(args, device)
 
     main_print(f"--> loading SD3 model from {args.pretrained_model_name_or_path}")
     transformer = SD3Transformer2DModel.from_pretrained(
@@ -789,10 +724,23 @@ def run_training_sd35(args):
         args.pretrained_model_name_or_path,
         subfolder="scheduler",
     )
+
+    if resume_ckpt_dir is not None:
+        load_transformer_weights(transformer, resume_ckpt_dir)
+
     ema_model = deepcopy(transformer) if args.use_ema else None
+    if ema_model is not None and resume_ckpt_dir is not None:
+        ema_dir = ema_checkpoint_dir(resume_ckpt_dir)
+        if ema_dir is not None:
+            load_transformer_weights(ema_model, ema_dir, label="EMA")
+        else:
+            main_print(
+                "--> no EMA checkpoint alongside the resume directory; "
+                "seeding EMA from the restored transformer weights"
+            )
     fsdp_kwargs, no_split_modules = get_dit_fsdp_kwargs(
         transformer,
-        args.fsdp_sharding_startegy,
+        args.fsdp_sharding_strategy,
         False,
         args.use_cpu_offload,
         args.master_weight_type,
@@ -850,6 +798,20 @@ def run_training_sd35(args):
         if args.select_idx_seed is not None
         else None
     )
+
+    # Weights were restored before FSDP wrapping; this recovers the optimizer,
+    # LR schedule and step counter.
+    init_steps = 0
+    if resume_ckpt_dir is not None:
+        init_steps = resume_training_state(
+            transformer, optimizer, lr_scheduler, resume_ckpt_dir, rank
+        )
+        if init_steps >= args.max_train_steps:
+            main_print(
+                f"--> checkpoint step {init_steps} already reaches max_train_steps="
+                f"{args.max_train_steps}; nothing to do"
+            )
+
     if rank <= 0:
         wandb.init(project=args.project, config=args, name=args.run_name)
 
@@ -857,19 +819,25 @@ def run_training_sd35(args):
     main_print("***** Running SD3.5 training *****")
     main_print(f"  Num examples = {len(train_dataset)}")
     main_print(f"  Dataloader size = {len(train_dataloader)}")
+    main_print(f"  Resume training from step {init_steps}")
     main_print(f"  Instantaneous batch size per device = {args.train_batch_size}")
     main_print(f"  Total train batch size = {total_batch_size}")
     main_print(f"  Total optimization steps = {args.max_train_steps}")
     main_print(f"  Master weight dtype: {next(transformer.parameters()).dtype}")
 
     loader = _iter_sd35_loader(train_dataloader, device)
-    progress_bar = tqdm(range(1, args.max_train_steps + 1), desc="Steps", disable=local_rank > 0)
+    progress_bar = tqdm(
+        range(1, args.max_train_steps + 1),
+        initial=init_steps,
+        desc="Steps",
+        disable=local_rank > 0,
+    )
     step_times = deque(maxlen=100)
 
     for epoch in range(1):
         if isinstance(sampler, DistributedSampler):
             sampler.set_epoch(epoch)
-        for step in range(1, args.max_train_steps + 1):
+        for step in range(init_steps + 1, args.max_train_steps + 1):
             args.current_train_step = step
             start_time = time.time()
             total_loss = 0.0
@@ -899,7 +867,16 @@ def run_training_sd35(args):
                 for tgt, src in zip(ema_model.parameters(), transformer.parameters()):
                     tgt.data.lerp_(src.data.to(tgt), 1 - args.ema_decay)
             if step % args.checkpointing_steps == 0:
-                save_checkpoint(transformer, rank, args.output_dir, step, epoch)
+                save_checkpoint(
+                    transformer,
+                    rank,
+                    args.output_dir,
+                    step,
+                    epoch,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    save_optimizer_state=getattr(args, "save_optimizer_state", False),
+                )
                 if args.use_ema:
                     save_sharded_ema_checkpoint(ema_model, rank, args.output_dir, step, epoch)
                 dist.barrier()

@@ -3,11 +3,9 @@
 FlowBP-Sparse trainer for SD3.5: single no-grad rollout per
 training step; K active steps re-forwarded with grad; full Euler composition
 produces ``x_0_hat``; straight-through residual onto the cached ``x_0``;
-backward only flows through the K active velocities, each rescaled by
-``flowbp_sparse_grad_rescale``.
+backward only flows through the K active velocities.
 
-Owns ``_sample_late_biased_indices`` (reused by the FlowBP-Bridge trainer,
-shared by FlowBP-Bridge).
+Owns ``_sample_active_indices`` (reused by the FlowBP-Bridge trainer).
 """
 
 from __future__ import annotations
@@ -24,21 +22,16 @@ from flowbp.trainers.sd35.leapalign import (
 )
 
 
-def _sample_late_biased_indices(
+def _sample_active_indices(
     num_steps,
     num_active,
-    bias,
     generator,
     start_idx=0,
     end_idx=None,
 ):
-    """Power-law late-biased multinomial sampling of K distinct timesteps.
+    """Uniform sampling of K distinct timesteps from ``[start_idx, end_idx)``.
 
-    Mirrors FlowBP-Sparse ``_sample_late_biased_indices``:
-    weights ``w_i = (i + 1) ** bias`` (in rollout cache, larger idx = closer
-    to clean image side = larger sigma delta consumed in that step). Larger
-    ``bias`` skews active steps toward the image end, which is where reward
-    gradients are most informative for HPSv2-style rewards.
+    Mirrors the FLUX ``_sample_active_indices``.
     """
     end_idx = int(num_steps if end_idx is None else end_idx)
     start_idx = int(start_idx)
@@ -51,15 +44,11 @@ def _sample_late_biased_indices(
     num_active = max(1, min(int(num_active), int(window_len)))
     if num_active >= window_len:
         return list(range(start_idx, end_idx))
-    idx = torch.arange(start_idx, end_idx, dtype=torch.float32)
-    weights = (idx + 1.0).pow(float(bias))
-    weights = weights / weights.sum()
-    chosen = torch.multinomial(
-        weights,
-        num_samples=num_active,
-        replacement=False,
+    chosen = torch.randperm(
+        window_len,
+        device="cpu",
         generator=generator,
-    )
+    )[:num_active]
     return sorted(start_idx + int(k) for k in chosen.tolist())
 
 
@@ -68,15 +57,11 @@ def _compose_x0_from_velocities(
     sigmas,
     v_history,
     active_velocities,
-    grad_rescale_factor,
 ):
     """Full Euler integration giving x_0_hat.
 
     Cached steps use the detached cached velocity; active steps use the new
-    differentiable velocity, with its grad-flowing component scaled by
-    ``grad_rescale_factor``. Forward value is unchanged by the rescale
-    (``v.detach() + g * (v - v.detach())`` evaluates to ``v``); only the
-    backward gradient scales by ``g``. Mirrors the shared FLUX implementation.
+    differentiable velocity. Mirrors the shared FLUX implementation.
     """
     total_steps = len(v_history)
     x = x_init.float()
@@ -86,7 +71,6 @@ def _compose_x0_from_velocities(
         delta = sigma_next - sigma_i
         if idx in active_velocities:
             v = active_velocities[idx].float()
-            v = v.detach() + grad_rescale_factor * (v - v.detach())
         else:
             v = v_history[idx].detach().float()
         x = x + delta * v
@@ -111,8 +95,7 @@ def sample_flowbp_sparse_trajectory_sd35(
     power-law late-biased distribution; those K active steps are re-forwarded
     WITH gradient; x_0_hat is composed via full Euler integration in fp32;
     a straight-through residual matches x_0_conn forward to the true cached
-    x_0 while routing backward through the K active velocities (each rescaled
-    by grad_rescale_factor).
+    x_0 while routing backward through the K active velocities.
     """
     args._last_sample_keep_mask = None
     cache = _rollout_with_cache_sd35(
@@ -132,23 +115,15 @@ def sample_flowbp_sparse_trajectory_sd35(
 
     train_start_idx, train_end_idx = resolve_train_step_window(args, total_steps)
     train_window_len = train_end_idx - train_start_idx
-    num_active = int(getattr(args, "flowbp_sparse_num_active_steps", 3))
+    num_active = int(args.num_active_steps)
     if num_active < 1:
         raise ValueError(
-            f"flowbp_sparse_num_active_steps must be >=1, got {num_active}"
+            f"num_active_steps must be >=1, got {num_active}"
         )
     num_active = min(num_active, train_window_len)
-    late_bias = float(getattr(args, "flowbp_sparse_late_bias", 2.0))
-    grad_rescale = float(getattr(args, "flowbp_sparse_grad_rescale", 0.0))
-    if grad_rescale < 0.0:
-        raise ValueError(
-            f"flowbp_sparse_grad_rescale must be >= 0, got {grad_rescale}"
-        )
-
-    selected_indices = _sample_late_biased_indices(
+    selected_indices = _sample_active_indices(
         num_steps=total_steps,
         num_active=num_active,
-        bias=late_bias,
         generator=generator,
         start_idx=train_start_idx,
         end_idx=train_end_idx,
@@ -160,11 +135,6 @@ def sample_flowbp_sparse_trajectory_sd35(
     deltas_abs = (sigmas_seg[1:] - sigmas_seg[:-1]).abs()
     total_abs = deltas_abs[train_start_idx:train_end_idx].sum()
     active_abs = sum(deltas_abs[k] for k in selected_indices)
-
-    grad_rescale_factor = 1.0
-    if grad_rescale > 0.0 and float(active_abs) > 1e-8:
-        full_factor = float((total_abs / active_abs).item())
-        grad_rescale_factor = 1.0 + grad_rescale * (full_factor - 1.0)
 
     active_velocities: dict[int, torch.Tensor] = {}
     for k in selected_indices:
@@ -186,7 +156,6 @@ def sample_flowbp_sparse_trajectory_sd35(
         sigmas=cache["sigmas"],
         v_history=cache["v_history"],
         active_velocities=active_velocities,
-        grad_rescale_factor=grad_rescale_factor,
     )
 
     x_0_true = cache["x0"].detach().float()
@@ -214,17 +183,8 @@ def sample_flowbp_sparse_trajectory_sd35(
         "active_min_idx": selected_idx_tensor.min(),
         "active_max_idx": selected_idx_tensor.max(),
         "active_mean_idx": selected_idx_tensor.mean(),
-        "grad_rescale_factor": torch.tensor(
-            float(grad_rescale_factor), device=device, dtype=torch.float32,
-        ),
         "active_abs_weight_sum": active_abs.detach().float(),
         "total_abs_weight_sum": total_abs.detach().float(),
-        "flowbp_sparse_grad_rescale": torch.tensor(
-            float(grad_rescale), device=device, dtype=torch.float32,
-        ),
-        "flowbp_sparse_late_bias": torch.tensor(
-            float(late_bias), device=device, dtype=torch.float32,
-        ),
         "train_step_start_idx": torch.tensor(
             float(train_start_idx), device=device, dtype=torch.float32,
         ),
@@ -243,9 +203,6 @@ def sample_flowbp_sparse_trajectory_sd35(
         "x0_pred": x_0_hat.detach(),
         "x0_true": x_0_true.detach(),
         "compose_err_per_sample": err_compose_per_sample.detach(),
-        "grad_rescale_factor": float(grad_rescale_factor),
-        "flowbp_sparse_grad_rescale": float(grad_rescale),
-        "flowbp_sparse_late_bias": float(late_bias),
         "train_step_start_idx": int(train_start_idx),
         "train_step_end_idx": int(train_end_idx),
         "active_count": int(num_active),

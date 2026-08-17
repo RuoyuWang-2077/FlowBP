@@ -1,17 +1,21 @@
 """
-UnifiedReward scorer via OpenAI-compatible HTTP API (e.g., sglang).
+UnifiedReward scorer.
 
-This scorer supports remote serving. Configure endpoint with either:
-  - FLOWBP_UNIFIEDREWARD_BASE_URL (e.g., http://127.0.0.1:17140/v1)
-or:
-  - FLOWBP_UNIFIEDREWARD_HOST + FLOWBP_UNIFIEDREWARD_PORT
+Two backends are available:
 
-Optional env vars:
-  - FLOWBP_UNIFIEDREWARD_BACKEND (openai|local, default: openai)
-  - FLOWBP_UNIFIEDREWARD_MODEL_NAME (default: UnifiedReward-7b-v1.5)
-  - FLOWBP_UNIFIEDREWARD_API_KEY (default: EMPTY)
-  - FLOWBP_UNIFIEDREWARD_TIMEOUT (seconds, default: 120)
-  - FLOWBP_UNIFIEDREWARD_LOCAL_MODEL_PATH (for backend=local)
+* ``local`` (default) loads the LLaVA-Qwen checkpoint in-process, so
+  ``ur-align`` / ``ur-iq`` behave like every other reward in ``eval.reward_fn``
+  with no external service to start. Each rank keeps its own copy (~16 GB) and
+  MultiScorer offloads it to CPU between evals; the weights are cached at module
+  scope so repeated evals do not re-read the checkpoint from disk.
+* ``openai`` talks to an OpenAI-compatible server (e.g. sglang) instead, which
+  is useful when GPU memory is tight or one server is shared by many jobs.
+
+Env vars:
+  - FLOWBP_UNIFIEDREWARD_BACKEND (local|openai, default: local)
+  - FLOWBP_UNIFIEDREWARD_LOCAL_MODEL_PATH (backend=local)
+  - FLOWBP_UNIFIEDREWARD_BASE_URL, or _HOST + _PORT (backend=openai)
+  - FLOWBP_UNIFIEDREWARD_MODEL_NAME / _API_KEY / _TIMEOUT (backend=openai)
 """
 
 from __future__ import annotations
@@ -28,6 +32,32 @@ from PIL import Image
 
 
 _SCORE_PATTERN = re.compile(r"Final Score:\s*([1-5](?:\.\d+)?)", re.IGNORECASE)
+
+# Hub id by default; point FLOWBP_UNIFIEDREWARD_LOCAL_MODEL_PATH at a local
+# checkout to run offline.
+DEFAULT_LOCAL_MODEL_PATH = "CodeGoat24/UnifiedReward-7b-v1.5"
+
+# One shared (tokenizer, model, image_processor) per checkpoint. The align and
+# image-quality criteria differ only in the prompt, so without this each of them
+# would load its own 16 GB copy.
+_LOCAL_MODEL_CACHE: dict[str, tuple] = {}
+
+
+def _patch_transformers_for_llava() -> None:
+    """Re-export the helpers LLaVA-NeXT expects on ``transformers.modeling_utils``.
+
+    LLaVA-NeXT targets transformers ~4.46, where ``apply_chunking_to_forward``,
+    ``find_pruneable_heads_and_indices`` and friends were still re-exported from
+    ``modeling_utils``. They now live only in ``pytorch_utils``. Aliasing them
+    back keeps LLaVA importable on the transformers version FLUX.2 needs (>=4.51
+    for Qwen3), so both stacks coexist in one environment.
+    """
+    import transformers.modeling_utils as modeling_utils
+    import transformers.pytorch_utils as pytorch_utils
+
+    for name in dir(pytorch_utils):
+        if not name.startswith("_") and not hasattr(modeling_utils, name):
+            setattr(modeling_utils, name, getattr(pytorch_utils, name))
 
 
 def _import_openai_client():
@@ -137,7 +167,7 @@ class UnifiedRewardScorer(torch.nn.Module):
                 f"expected one of {sorted(_QUESTION_BUILDERS)}."
             )
         self.backend = os.environ.get(
-            "FLOWBP_UNIFIEDREWARD_BACKEND", "openai"
+            "FLOWBP_UNIFIEDREWARD_BACKEND", "local"
         ).strip().lower()
         if self.backend not in {"openai", "local"}:
             raise ValueError(
@@ -168,27 +198,35 @@ class UnifiedRewardScorer(torch.nn.Module):
         self.eval()
 
     def _init_local_backend(self) -> None:
+        _patch_transformers_for_llava()
         try:
             from llava.model.builder import load_pretrained_model
         except ImportError as e:
             raise ImportError(
                 "Local UnifiedReward backend requires LLaVA-NeXT. "
-                "Install it in an isolated env via "
-                "`pip install git+https://github.com/LLaVA-VL/LLaVA-NeXT.git`."
+                "Install it via "
+                "`pip install --no-deps git+https://github.com/LLaVA-VL/LLaVA-NeXT.git` "
+                "(--no-deps keeps the transformers version FLUX.2 needs)."
             ) from e
 
         model_path = os.environ.get(
             "FLOWBP_UNIFIEDREWARD_LOCAL_MODEL_PATH",
-            "UnifiedReward-7b-v1.5",
+            DEFAULT_LOCAL_MODEL_PATH,
         )
-        self._tokenizer, self._model, self._image_processor, _ = load_pretrained_model(
-            model_path,
-            None,
-            "llava_qwen",
-            device_map="auto",
-            overwrite_config={"text_config": None},
-        )
-        self._model.eval()
+        cached = _LOCAL_MODEL_CACHE.get(model_path)
+        if cached is None:
+            # Pin to this rank's device: ``auto`` would shard across every
+            # visible GPU, which collides with the other ranks in a DDP eval.
+            cached = load_pretrained_model(
+                model_path,
+                None,
+                "llava_qwen",
+                device_map=str(self.device),
+                overwrite_config={"text_config": None},
+            )[:3]
+            cached[1].eval()
+            _LOCAL_MODEL_CACHE[model_path] = cached
+        self._tokenizer, self._model, self._image_processor = cached
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
